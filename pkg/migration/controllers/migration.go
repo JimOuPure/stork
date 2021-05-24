@@ -57,6 +57,11 @@ const (
 	// StorkMigrationCRDDeactivateAnnotation is the annotation used to keep track of
 	// the value to be set for deactivating crds
 	StorkMigrationCRDDeactivateAnnotation = "stork.libopenstorage.org/migrationCRDDeactivate"
+	// storageClassAnnotation for pvc's
+	storageClassAnnotation = "volume.beta.kubernetes.io/storage-class"
+	// storageClassAnnotation for pvc's
+	PVReclaimAnnotation = "stork.libopenstorage.org/reclaimPolicy"
+
 	// Max number of times to retry applying resources on the desination
 	maxApplyRetries      = 10
 	cattleAnnotations    = "cattle.io"
@@ -875,6 +880,11 @@ func (m *MigrationController) prepareResources(
 			if err != nil {
 				return fmt.Errorf("error preparing PV resource %v: %v", metadata.GetName(), err)
 			}
+		case "PersistentVolumeClaim":
+			err := m.preparePVCResource(migration, o)
+			if err != nil {
+				return fmt.Errorf("error preparing PV resource %v: %v", metadata.GetName(), err)
+			}
 		case "Deployment", "StatefulSet", "DeploymentConfig", "IBPPeer", "IBPCA", "IBPConsole", "IBPOrderer":
 			err := m.prepareApplicationResource(migration, o)
 			if err != nil {
@@ -1018,16 +1028,38 @@ func (m *MigrationController) preparePVResource(
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.UnstructuredContent(), &pv); err != nil {
 		return err
 	}
-	// Set the reclaim policy to retain if the volumes are not being migrated
-	if migration.Spec.IncludeVolumes != nil && !*migration.Spec.IncludeVolumes {
-		pv.Spec.PersistentVolumeReclaimPolicy = v1.PersistentVolumeReclaimRetain
-	}
-
+	// lets keep retain policy always before applying migration
+	pv.Spec.PersistentVolumeReclaimPolicy = v1.PersistentVolumeReclaimRetain
 	_, err := m.volDriver.UpdateMigratedPersistentVolumeSpec(&pv)
 	if err != nil {
 		return err
 	}
 	o, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&pv)
+	if err != nil {
+		return err
+	}
+	object.SetUnstructuredContent(o)
+
+	return nil
+}
+
+func (m *MigrationController) preparePVCResource(
+	migration *stork_api.Migration,
+	object runtime.Unstructured,
+) error {
+	var pvc v1.PersistentVolumeClaim
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object.UnstructuredContent(), &pvc); err != nil {
+		return err
+	}
+
+	if pvc.Annotations != nil {
+		delete(pvc.Annotations, storageClassAnnotation)
+	}
+	sc := ""
+	if pvc.Spec.StorageClassName != nil && *pvc.Spec.StorageClassName != "" {
+		pvc.Spec.StorageClassName = &sc
+	}
+	o, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&pvc)
 	if err != nil {
 		return err
 	}
@@ -1296,6 +1328,9 @@ func (m *MigrationController) applyResources(
 	ruleset := inflect.NewDefaultRuleset()
 	ruleset.AddPlural("quota", "quotas")
 	ruleset.AddPlural("prometheus", "prometheuses")
+
+	var pvObjects []v1.PersistentVolume
+	var pvcObjects []v1.PersistentVolumeClaim
 	for _, o := range objects {
 		metadata, err := meta.Accessor(o)
 		if err != nil {
@@ -1338,17 +1373,28 @@ func (m *MigrationController) applyResources(
 			_, err = dynamicClient.Create(context.TODO(), unstructured, metav1.CreateOptions{})
 			if err != nil && (errors.IsAlreadyExists(err) || strings.Contains(err.Error(), portallocator.ErrAllocated.Error())) {
 				switch objectType.GetKind() {
-				// Don't want to delete the Volume resources
-				case "PersistentVolumeClaim":
-					err = nil
 				case "PersistentVolume":
 					if migration.Spec.IncludeVolumes == nil || *migration.Spec.IncludeVolumes {
 						err = nil
 					} else {
 						_, err = dynamicClient.Update(context.TODO(), unstructured, metav1.UpdateOptions{})
 					}
+					var pv v1.PersistentVolume
+					if err := runtime.DefaultUnstructuredConverter.FromUnstructured(o.UnstructuredContent(), &pv); err != nil {
+						return err
+					}
+					pvObjects = append(pvObjects, pv)
 				case "ServiceAccount":
 					err = m.checkAndUpdateDefaultSA(migration, o)
+				case "PersistentVolumeClaim":
+					var pvc v1.PersistentVolumeClaim
+					if err := runtime.DefaultUnstructuredConverter.FromUnstructured(o.UnstructuredContent(), &pvc); err != nil {
+						return err
+					}
+					pvcObjects = append(pvcObjects, pvc)
+					err = nil
+					// allow deletion of pvcs
+					fallthrough
 				default:
 					// Delete the resource if it already exists on the destination
 					// cluster and try creating again
@@ -1396,6 +1442,43 @@ func (m *MigrationController) applyResources(
 				o,
 				stork_api.MigrationStatusSuccessful,
 				"Resource migrated successfully")
+		}
+	}
+
+	// recreate pvc objects
+	for _, pvc := range pvcObjects {
+		deleteStart := metav1.Now()
+		if err := adminClient.CoreV1().PersistentVolumeClaims(pvc.GetNamespace()).Delete(context.TODO(), pvc.Name, metav1.DeleteOptions{}); err != nil {
+			return err
+		}
+		for i := 0; i < deletedMaxRetries; i++ {
+			obj, err := adminClient.CoreV1().PersistentVolumeClaims(pvc.GetNamespace()).Get(context.TODO(), pvc.Name, metav1.GetOptions{})
+			if err != nil && errors.IsNotFound(err) {
+				break
+			}
+			createTime := obj.GetCreationTimestamp()
+			if deleteStart.Before(&createTime) {
+				logrus.Warnf("Object[%v] got re-created after deletion. So, Ignore wait. deleteStart time:[%v], create time:[%v]",
+					obj.GetName(), deleteStart, createTime)
+				break
+			}
+			logrus.Warnf("Object %v still present, retrying in %v", pvc.GetName(), deletedRetryInterval)
+			time.Sleep(deletedRetryInterval)
+		}
+		if _, err := adminClient.CoreV1().PersistentVolumeClaims(pvc.GetNamespace()).Create(context.TODO(), &pvc, metav1.CreateOptions{}); err != nil {
+			return err
+		}
+	}
+	// revert pv objects
+	for _, pv := range pvObjects {
+		if pv.Annotations != nil && pv.Annotations[PVReclaimAnnotation] != "" {
+			pv.Spec.PersistentVolumeReclaimPolicy = v1.PersistentVolumeReclaimPolicy(pv.Annotations[PVReclaimAnnotation])
+		}
+		if migration.Spec.IncludeVolumes != nil && !*migration.Spec.IncludeVolumes {
+			pv.Spec.PersistentVolumeReclaimPolicy = v1.PersistentVolumeReclaimRetain
+		}
+		if _, err := adminClient.CoreV1().PersistentVolumes().Update(context.TODO(), &pv, metav1.UpdateOptions{}); err != nil {
+			return err
 		}
 	}
 	return nil
